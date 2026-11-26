@@ -1,0 +1,15 @@
+[package]
+name = "pvpn-android"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "pvpn"
+crate-type = ["cdylib"]
+
+[dependencies]
+jni = "0.21"
+pvpn-client = { path = "../pvpn-client" }
+pvpn-core = { path = "../pvpn-core" }
+tokio.workspace = true

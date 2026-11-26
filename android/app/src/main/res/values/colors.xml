@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="ic_launcher_background">#061019</color>
+    <color name="bg">#071018</color>
+    <color name="card">#0F181E</color>
+    <color name="card_stroke">#22343A</color>
+    <color name="text_primary">#E8FFF8</color>
+    <color name="text_secondary">#8BA29E</color>
+    <color name="mint">#8BFFD1</color>
+    <color name="aqua">#3DE8C4</color>
+    <color name="danger">#FF7E7E</color>
+    <color name="danger_bg">#2A1416</color>
+    <color name="danger_stroke">#6E2D30</color>
+</resources>

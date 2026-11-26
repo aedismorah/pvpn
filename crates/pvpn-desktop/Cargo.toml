@@ -1,0 +1,16 @@
+[package]
+name = "pvpn-desktop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+eframe = "0.31"
+pvpn-client = { path = "../pvpn-client" }
+pvpn-core = { path = "../pvpn-core" }
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+tokio.workspace = true
+windows-sys = { version = "0.59", features = ["Win32_Networking_WinInet"] }

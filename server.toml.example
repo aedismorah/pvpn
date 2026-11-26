@@ -1,0 +1,6 @@
+# Copy to server.toml on the VDSina host.
+listen = "0.0.0.0:18443"
+psk = "replace-with-64-hex-characters"
+connect_timeout_secs = 15
+max_frame = 65535
+allow_private_targets = false

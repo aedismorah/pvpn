@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">pvpn</string>
+    <string name="server_hint">Cloud.ru ingress (host:port)</string>
+    <string name="psk_hint">PSK (64 hex characters)</string>
+    <string name="listen_hint">Local SOCKS5 (host:port)</string>
+    <string name="start">Start SOCKS5</string>
+    <string name="stop">Stop SOCKS5</string>
+    <string name="start_vpn">Start VPN</string>
+    <string name="stop_vpn">Stop VPN</string>
+    <string name="status_stopped">Not connected</string>
+    <string name="status_running">SOCKS5 is running on %1$s</string>
+    <string name="status_vpn">VPN active - all apps</string>
+    <string name="status_starting">Starting...</string>
+    <string name="status_error">Action failed</string>
+    <string name="show_psk">Show</string>
+    <string name="copy">Copy</string>
+    <string name="dismiss">Dismiss</string>
+    <string name="ping">Ping</string>
+    <string name="speed_test">Speed test</string>
+    <string name="test_idle">Ping checks the ingress and the local SOCKS5 path. Speed test downloads 5 MB through the tunnel.</string>
+    <string name="test_pinging">Pinging ingress and tunnel...</string>
+    <string name="test_ping_failed">Ping failed: %1$s</string>
+    <string name="test_speed_running">Downloading 5 MB through the tunnel...</string>
+    <string name="test_speed_failed">Speed test failed: %1$s</string>
+    <string name="youtube_test">YouTube test</string>
+    <string name="copy_log">Copy log</string>
+    <string name="tcp_only">Prefer TCP (disable QUIC/UDP)</string>
+    <string name="youtube_test_running">Running YouTube traffic test...</string>
+    <string name="youtube_test_done">YouTube diag complete; log copied to clipboard.</string>
+    <string name="youtube_test_failed">YouTube diag failed: %1$s</string>
+    <string name="notification_channel">pvpn tunnel</string>
+    <string name="notification_title">pvpn tunnel</string>
+    <string name="notification_text">SOCKS5 on %1$s</string>
+</resources>

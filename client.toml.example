@@ -1,0 +1,5 @@
+# Copy to client.toml on Windows / Android core.
+listen = "127.0.0.1:11080"
+server = "87.242.102.100:9331"
+psk = "replace-with-64-hex-characters"
+connect_timeout_secs = 15
