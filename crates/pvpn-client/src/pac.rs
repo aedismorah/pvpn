@@ -9,6 +9,7 @@ use tokio::sync::watch;
 pub struct PacState {
     domains: Arc<RwLock<Vec<String>>>,
     blacklist: Arc<AtomicBool>,
+    proxy_all: Arc<AtomicBool>,
     proxy: Arc<RwLock<String>>,
 }
 
@@ -17,6 +18,7 @@ impl PacState {
         Self {
             domains: Arc::new(RwLock::new(Vec::new())),
             blacklist: Arc::new(AtomicBool::new(false)),
+            proxy_all: Arc::new(AtomicBool::new(false)),
             proxy: Arc::new(RwLock::new(proxy.into())),
         }
     }
@@ -45,6 +47,14 @@ impl PacState {
         self.blacklist.load(Ordering::Relaxed)
     }
 
+    pub fn set_proxy_all(&self, enabled: bool) {
+        self.proxy_all.store(enabled, Ordering::Relaxed);
+    }
+
+    pub fn proxy_all(&self) -> bool {
+        self.proxy_all.load(Ordering::Relaxed)
+    }
+
     pub fn pac(&self) -> Vec<u8> {
         let domains = serde_json::to_string(&self.domains()).unwrap_or_else(|_| "[]".into());
         let proxy = self
@@ -55,17 +65,29 @@ impl PacState {
             .replace('\\', "\\\\")
             .replace('\'', "\\'");
         let blacklist = if self.blacklist() { "true" } else { "false" };
+        let proxy_all = if self.proxy_all() { "true" } else { "false" };
         format!(
             r#"var sites = {domains};
 var blacklist = {blacklist};
+var proxyAll = {proxy_all};
 var proxy = "PROXY {proxy}";
 function FindProxyForURL(url, host) {{
-    host = host.toLowerCase().replace(/\.$/, "");
-    if (host === "localhost" || host.indexOf(".") === -1 ||
-        /\.local$/.test(host) || /^127\./.test(host) ||
-        /^10\./.test(host) || /^192\.168\./.test(host) ||
-        /^172\.(1[6-9]|2[0-9]|3[01])\./.test(host) ||
-        /^169\.254\./.test(host)) return "DIRECT";
+    host = host.toLowerCase().replace(/\.$/, "").replace(/^\[/, "").replace(/\]$/, "");
+    var ipv6 = host.indexOf(":") !== -1;
+    var ipv4 = /^(\d{{1,3}})\.(\d{{1,3}})\.(\d{{1,3}})\.(\d{{1,3}})$/.exec(host);
+    if (ipv4) {{
+        var a = +ipv4[1], b = +ipv4[2];
+        if (a === 0 || a === 10 || a === 127 ||
+            (a === 169 && b === 254) ||
+            (a === 172 && b >= 16 && b <= 31) ||
+            (a === 192 && b === 168) ||
+            (a === 100 && b >= 64 && b <= 127) ||
+            a >= 224) return "DIRECT";
+    }}
+    if (host === "localhost" || (!ipv6 && host.indexOf(".") === -1) ||
+        /\.local$/.test(host) ||
+        (ipv6 && (host === "::1" || /^f[cd]/.test(host) || /^fe[89ab]/.test(host)))) return "DIRECT";
+    if (proxyAll) return proxy;
     var listed = false;
     for (var i = 0; i < sites.length; i++) {{
         var d = sites[i];
@@ -160,6 +182,15 @@ mod tests {
         assert!(String::from_utf8(state.pac()).unwrap().contains("var blacklist = false"));
         state.set_blacklist(true);
         assert!(String::from_utf8(state.pac()).unwrap().contains("var blacklist = true"));
+    }
+
+    #[test]
+    fn proxy_all_handles_ipv6() {
+        let state = PacState::new("127.0.0.1:11081");
+        state.set_proxy_all(true);
+        let pac = String::from_utf8(state.pac()).unwrap();
+        assert!(pac.contains("var proxyAll = true"));
+        assert!(pac.contains("var ipv6 = host.indexOf"));
     }
 }
 

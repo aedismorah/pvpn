@@ -129,8 +129,9 @@ public class MainActivity extends Activity {
 
         SharedPreferences prefs = getSharedPreferences(PREFS, MODE_PRIVATE);
         String savedServer = prefs.getString("server", "87.242.102.100:9331");
-        if (savedServer.endsWith(":9443") || savedServer.endsWith(":443")) {
-            savedServer = savedServer.substring(0, savedServer.lastIndexOf(':')) + ":9331";
+        if (savedServer.equals("87.242.102.100:9443")
+                || savedServer.equals("87.242.102.100:443")) {
+            savedServer = "87.242.102.100:9331";
         }
         server.setText(savedServer);
         listen.setText(prefs.getString("listen", "127.0.0.1:11080"));

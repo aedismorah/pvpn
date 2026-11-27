@@ -101,8 +101,26 @@ keys out of git.
 ```
 
 Start the tunnel, then enable the system proxy. Split tunneling is PAC/domain
-based; Telegram Desktop and apps that ignore the Windows proxy need the local
-SOCKS5 listener. See `docs/DESKTOP.md`.
+based. Use **Disable split tunneling** in the Split tunneling card to send all
+traffic through the proxy. Apps that ignore the Windows proxy (Codex, some
+Electron/CLI tools) need the proxy environment variables below; Telegram
+Desktop and other apps that ignore both settings need the local SOCKS5
+listener. See `docs/DESKTOP.md`.
+
+### Codex Desktop
+
+Codex does not read PAC. Set these user environment variables and restart
+Codex (and Explorer, so the new process inherits them):
+
+```powershell
+setx HTTP_PROXY  "http://127.0.0.1:11081"
+setx HTTPS_PROXY "http://127.0.0.1:11081"
+setx NO_PROXY    "localhost,127.0.0.1,::1"
+```
+
+`NO_PROXY` is required so Codex can reach local MCP servers such as
+`http://127.0.0.1:9765/mcp` directly.
+
 
 ## Android
 

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -51,14 +51,17 @@ struct Shared {
 }
 
 impl Shared {
-    async fn pick(&self) -> Option<(String, String)> {
+    async fn pick(&self, exclude: &HashSet<String>) -> Option<(String, String)> {
         let servers = self.servers.read().await;
         let mut candidates: Vec<&RuntimeServer> = servers
             .iter()
-            .filter(|s| s.entry.enabled && s.healthy)
+            .filter(|s| s.entry.enabled && s.healthy && !exclude.contains(&s.entry.name))
             .collect();
         if candidates.is_empty() {
-            candidates = servers.iter().filter(|s| s.entry.enabled).collect();
+            candidates = servers
+                .iter()
+                .filter(|s| s.entry.enabled && !exclude.contains(&s.entry.name))
+                .collect();
         }
         candidates
             .into_iter()
@@ -199,10 +202,12 @@ pub async fn run(config_path: PathBuf, config: RelayConfig) -> anyhow::Result<()
 async fn handle_connection(mut downstream: TcpStream, shared: Arc<Shared>) -> anyhow::Result<()> {
     downstream.set_nodelay(true)?;
 
+    let mut tried = HashSet::new();
     for _ in 0..3 {
-        let Some((name, addr)) = shared.pick().await else {
+        let Some((name, addr)) = shared.pick(&tried).await else {
             break;
         };
+        tried.insert(name.clone());
         let connect = async {
             let stream = TcpStream::connect(addr.as_str()).await?;
             stream.set_nodelay(true)?;

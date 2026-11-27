@@ -7,7 +7,7 @@ use zeroize::Zeroize;
 use crate::config::Psk;
 use crate::crypto::{hmac_tag, verify_hmac, AuthKey, FrameCipher, SessionKeys};
 
-const VERSION: u8 = 1;
+const VERSION: u8 = 2;
 const HELLO_LEN: usize = 128;
 const CLIENT_FIXED: usize = 1 + 32 + 16 + 32; // 81
 const SERVER_FIXED: usize = 32 + 16 + 32; // 80

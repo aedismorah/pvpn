@@ -43,12 +43,12 @@ pub async fn handle(mut local: TcpStream, config: Arc<pvpn_core::ClientConfig>) 
         };
         let target = target_for(&host, port);
         match open_session(&config, &target).await {
-            Ok(mut session) => {
+            Ok(session) => {
                 local
                     .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
                     .await?;
                 local.flush().await?;
-                relay_with_initial(&mut local, &mut session, &[]).await?;
+                relay_with_initial(&mut local, session, &[]).await?;
             }
             Err(error) => {
                 debug!(error = %error, "http CONNECT open failed");
@@ -74,7 +74,7 @@ pub async fn handle(mut local: TcpStream, config: Arc<pvpn_core::ClientConfig>) 
     let target = target_for(&host, port);
 
     match open_session(&config, &target).await {
-        Ok(mut session) => {
+        Ok(session) => {
             let mut forwarded = format!("{method} {path} HTTP/1.1\r\n");
             for line in lines {
                 if line.is_empty()
@@ -89,7 +89,7 @@ pub async fn handle(mut local: TcpStream, config: Arc<pvpn_core::ClientConfig>) 
             forwarded.push_str("Connection: close\r\n\r\n");
             let mut initial = forwarded.into_bytes();
             initial.extend_from_slice(&buffer[header_end + 4..]);
-            relay_with_initial(&mut local, &mut session, &initial).await?;
+            relay_with_initial(&mut local, session, &initial).await?;
         }
         Err(error) => {
             debug!(error = %error, "http request open failed");

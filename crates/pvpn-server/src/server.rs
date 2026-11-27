@@ -13,6 +13,12 @@ use tracing::{debug, info, warn};
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
+#[derive(Debug)]
+enum StreamInput {
+    Data(Vec<u8>),
+    ShutdownWrite,
+}
+
 pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
     let listener = TcpListener::bind(&config.listen).await?;
     info!(listen = %config.listen, "pvpn-server listening");
@@ -28,8 +34,7 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
     }
 }
 
-async fn handle_connection(mut socket: TcpStream, config: Arc<ServerConfig>) -> anyhow::Result<()> {
-    socket.set_nodelay(true)?;
+async fn handle_connection(mut socket: TcpStream, config: Arc<ServerConfig>) -> anyhow::Result<()> {    socket.set_nodelay(true)?;
     let (send, mut recv) = timeout(
         HANDSHAKE_TIMEOUT,
         server_handshake(&mut socket, &config.psk),
@@ -49,7 +54,7 @@ async fn handle_connection(mut socket: TcpStream, config: Arc<ServerConfig>) -> 
         }
     });
 
-    let mut streams: HashMap<u32, mpsc::Sender<Vec<u8>>> = HashMap::new();
+    let mut streams: HashMap<u32, mpsc::Sender<StreamInput>> = HashMap::new();
     let mut udp_streams: HashMap<u32, mpsc::Sender<(TargetAddr, Vec<u8>)>> = HashMap::new();
     loop {
         let frame = match read_frame(&mut reader, &mut recv, config.max_frame).await {
@@ -71,7 +76,7 @@ async fn handle_connection(mut socket: TcpStream, config: Arc<ServerConfig>) -> 
                         continue;
                     }
                 };
-                let (stream_tx, stream_rx) = mpsc::channel::<Vec<u8>>(64);
+                let (stream_tx, stream_rx) = mpsc::channel::<StreamInput>(64);
                 streams.insert(frame.stream_id, stream_tx);
                 let tx = tx.clone();
                 let connect_timeout = Duration::from_secs(config.connect_timeout_secs);
@@ -120,8 +125,13 @@ async fn handle_connection(mut socket: TcpStream, config: Arc<ServerConfig>) -> 
             frame_type::DATA => {
                 if let Some(stream) = streams.get(&frame.stream_id) {
                     if let Ok(data) = frame.decode_data() {
-                        let _ = stream.send(data.to_vec()).await;
+                        let _ = stream.send(StreamInput::Data(data.to_vec())).await;
                     }
+                }
+            }
+            frame_type::SHUT_WR => {
+                if let Some(stream) = streams.get(&frame.stream_id) {
+                    let _ = stream.send(StreamInput::ShutdownWrite).await;
                 }
             }
             frame_type::CLOSE => {
@@ -138,6 +148,7 @@ async fn handle_connection(mut socket: TcpStream, config: Arc<ServerConfig>) -> 
     }
 
     drop(streams);
+    drop(udp_streams);
     drop(tx);
     let _ = writer_task.await;
     Ok(())
@@ -231,7 +242,13 @@ async fn resolve_target(target: &TargetAddr, allow_private: bool) -> Result<Sock
 fn is_forbidden(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(ip) => ipv4_forbidden(ip),
-        IpAddr::V6(ip) => ipv6_forbidden(ip),
+        IpAddr::V6(ip) => {
+            if let Some(v4) = ip.to_ipv4_mapped().or_else(|| ip.to_ipv4()) {
+                ipv4_forbidden(v4)
+            } else {
+                ipv6_forbidden(ip)
+            }
+        }
     }
 }
 
@@ -258,11 +275,24 @@ fn ipv6_forbidden(ip: Ipv6Addr) -> bool {
         || ip.is_multicast()
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ipv4_mapped_ipv6_uses_ipv4_policy() {
+        assert!(is_forbidden("::ffff:127.0.0.1".parse().unwrap()));
+        assert!(is_forbidden("::ffff:192.168.1.10".parse().unwrap()));
+        assert!(is_forbidden("::ffff:10.0.0.1".parse().unwrap()));
+        assert!(!is_forbidden("::ffff:8.8.8.8".parse().unwrap()));
+    }
+}
+
 async fn handle_stream(
     stream_id: u32,
     target: TargetAddr,
     tx: mpsc::Sender<Frame>,
-    mut rx: mpsc::Receiver<Vec<u8>>,
+    mut rx: mpsc::Receiver<StreamInput>,
     connect_timeout: Duration,
     allow_private: bool,
 ) {
@@ -320,10 +350,17 @@ async fn handle_stream(
             }
             data = rx.recv() => {
                 match data {
-                    Some(data) => {
+                    Some(StreamInput::Data(data)) => {
                         if target_writer.write_all(&data).await.is_err() {
                             break;
                         }
+                    }
+                    Some(StreamInput::ShutdownWrite) => {
+                        if target_writer.shutdown().await.is_err() {
+                            break;
+                        }
+                        // Keep the target-to-client direction open: protocols such
+                        // as SMTP/FTP send their final reply after client EOF.
                     }
                     None => break,
                 }

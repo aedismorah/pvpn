@@ -11,7 +11,7 @@ use tokio::net::{TcpListener, TcpStream, UdpSocket};
 macro_rules! udp_debug {
     ($($arg:tt)*) => { () };
 }
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 use tokio::time::timeout;
 use tracing::{debug, info};
 
@@ -112,9 +112,9 @@ async fn handle_socks(mut local: TcpStream, config: Arc<ClientConfig>) -> anyhow
         socks5::Request::Connect(target) => {
             debug!(target = ?target, "socks request");
             match open_session(&config, &target).await {
-                Ok(mut session) => {
+                Ok(session) => {
                     socks5::reply_ok(&mut local).await?;
-                    relay(&mut local, &mut session).await?;
+                    relay(&mut local, session).await?;
                 }
                 Err(error) => {
                     debug!(error = %error, "session open failed");
@@ -127,7 +127,7 @@ async fn handle_socks(mut local: TcpStream, config: Arc<ClientConfig>) -> anyhow
             let udp = UdpSocket::bind("127.0.0.1:0").await?;
             let port = udp.local_addr()?.port();
             udp_debug!(&format!("udp bound port {port}"));
-            let mut session = match open_udp_session(&config).await {
+            let session = match open_udp_session(&config).await {
                 Ok(session) => session,
                 Err(error) => {
                     udp_debug!(&format!("udp control failed: {error}"));
@@ -139,7 +139,7 @@ async fn handle_socks(mut local: TcpStream, config: Arc<ClientConfig>) -> anyhow
             udp_debug!("udp control open");
             socks5::reply_udp(&mut local, port).await?;
             udp_debug!("udp reply sent");
-            relay_udp(&mut local, udp, &mut session).await?;
+            relay_udp(&mut local, udp, session).await?;
         }
     }
     Ok(())
@@ -175,7 +175,10 @@ async fn open_control(config: &ClientConfig, open: Frame) -> anyhow::Result<Sess
     if is_udp {
         udp_debug!("control tcp connecting");
     }
-    let mut socket = TcpStream::connect(&config.server).await?;
+    let connect_timeout = Duration::from_secs(config.connect_timeout_secs.max(1));
+    let mut socket = timeout(connect_timeout, TcpStream::connect(&config.server))
+        .await
+        .map_err(|_| anyhow::anyhow!("connect timeout"))??;
     if is_udp {
         udp_debug!("control tcp connected");
     }
@@ -199,7 +202,12 @@ async fn open_control(config: &ClientConfig, open: Frame) -> anyhow::Result<Sess
     }
 
     loop {
-        let frame = read_frame(&mut reader, &mut recv, 65_535).await?;
+        let frame = timeout(
+            connect_timeout,
+            read_frame(&mut reader, &mut recv, 65_535),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("OPEN_RESULT timeout"))??;
         if is_udp {
             udp_debug!(&format!("control frame type {:#x}", frame.typ));
         }
@@ -240,61 +248,66 @@ async fn open_control(config: &ClientConfig, open: Frame) -> anyhow::Result<Sess
 }
 
 pub(crate) async fn relay_udp(
-    _local: &mut TcpStream,
+    local: &mut TcpStream,
     udp: UdpSocket,
-    session: &mut Session,
+    session: Session,
 ) -> anyhow::Result<()> {
+    let Session {
+        reader,
+        mut writer,
+        mut send,
+        recv,
+        max_frame,
+    } = session;
+    let (frame_tx, mut frame_rx) = mpsc::channel(32);
+    let reader_task = tokio::spawn(frame_pump(reader, recv, max_frame, frame_tx));
     let mut buffer = vec![0u8; 65_535];
+    let mut control = [0u8; 1];
     let mut client = None;
     udp_debug!("relay udp start");
     loop {
         tokio::select! {
+            control_read = local.read(&mut control) => {
+                if control_read.unwrap_or(0) == 0 {
+                    udp_debug!("udp control closed");
+                    break;
+                }
+            }
             received = udp.recv_from(&mut buffer) => {
                 let Ok((len, source)) = received else {
                     udp_debug!("udp recv error");
                     break;
                 };
-                udp_debug!(&format!("udp from {source} len {len}"));
                 client = Some(source);
                 let Some((target, payload)) = socks5::parse_udp(&buffer[..len]) else {
-                    udp_debug!("udp parse failed");
                     continue;
                 };
                 let frame = match Frame::udp_data(STREAM_ID, &target, payload) {
                     Ok(frame) => frame,
                     Err(_) => continue,
                 };
-                if let Err(_error) = write_frame(&mut session.writer, &mut session.send, &frame).await {
-                    udp_debug!(&format!("udp write failed: {error}"));
+                if write_frame(&mut writer, &mut send, &frame).await.is_err() {
                     break;
                 }
             }
-            frame = read_frame(&mut session.reader, &mut session.recv, session.max_frame) => {
-                let frame = match frame {
-                    Ok(frame) => frame,
-                    Err(_error) => {
-                        udp_debug!(&format!("udp read failed: {error}"));
-                        break;
-                    }
+            incoming = frame_rx.recv() => {
+                let Some(frame) = incoming else {
+                    break;
                 };
                 match frame.typ {
                     frame_type::UDP_DATA => {
                         if let Ok((target, payload)) = frame.decode_udp_data() {
-                            udp_debug!(&format!("udp response {target:?} len {}", payload.len()));
                             if let Some(client) = client {
                                 let packet = socks5::encode_udp(&target, payload);
                                 let _ = udp.send_to(&packet, client).await;
                             }
                         }
                     }
-                    frame_type::CLOSE | frame_type::ERROR => {
-                        udp_debug!("udp close frame");
-                        break;
-                    }
+                    frame_type::CLOSE | frame_type::ERROR => break,
                     frame_type::PING => {
                         write_frame(
-                            &mut session.writer,
-                            &mut session.send,
+                            &mut writer,
+                            &mut send,
                             &Frame::pong(frame.stream_id, frame.body.clone()),
                         ).await?;
                     }
@@ -303,64 +316,77 @@ pub(crate) async fn relay_udp(
             }
         }
     }
-    udp_debug!("relay udp end");
-    let _ = write_frame(
-        &mut session.writer,
-        &mut session.send,
-        &Frame::close(STREAM_ID, 0),
-    )
-    .await;
+    reader_task.abort();
+    let _ = write_frame(&mut writer, &mut send, &Frame::close(STREAM_ID, 0)).await;
     Ok(())
 }
 
-pub(crate) async fn relay(local: &mut TcpStream, session: &mut Session) -> anyhow::Result<()> {
+pub(crate) async fn relay(local: &mut TcpStream, session: Session) -> anyhow::Result<()> {
     relay_with_initial(local, session, &[]).await
 }
 
 pub(crate) async fn relay_with_initial(
     local: &mut TcpStream,
-    session: &mut Session,
+    session: Session,
     initial: &[u8],
 ) -> anyhow::Result<()> {
+    let Session {
+        reader,
+        mut writer,
+        mut send,
+        recv,
+        max_frame,
+    } = session;
     if !initial.is_empty() {
         let frame = Frame::data_padded(STREAM_ID, initial.to_vec());
-        write_frame(&mut session.writer, &mut session.send, &frame).await?;
+        write_frame(&mut writer, &mut send, &frame).await?;
     }
 
+    let (frame_tx, mut frame_rx) = mpsc::channel(32);
+    let reader_task = tokio::spawn(frame_pump(reader, recv, max_frame, frame_tx));
     let (mut local_reader, mut local_writer) = local.split();
     let mut buffer = vec![0u8; 16 * 1024];
+    let mut local_open = true;
 
     loop {
         tokio::select! {
-            result = local_reader.read(&mut buffer) => {
+            result = local_reader.read(&mut buffer), if local_open => {
                 match result {
                     Ok(0) => {
+                        // Half-close: tell the exit to FIN the target write side,
+                        // but keep reading until the target closes its own side.
                         let _ = write_frame(
-                            &mut session.writer,
-                            &mut session.send,
-                            &Frame::close(STREAM_ID, 0),
+                            &mut writer,
+                            &mut send,
+                            &Frame::shutdown_write(STREAM_ID),
                         ).await;
-                        break;
+                        local_open = false;
                     }
                     Ok(n) => {
                         let frame = Frame::data_padded(STREAM_ID, buffer[..n].to_vec());
-                        write_frame(&mut session.writer, &mut session.send, &frame).await?;
+                        if write_frame(&mut writer, &mut send, &frame).await.is_err() {
+                            break;
+                        }
                     }
                     Err(_) => break,
                 }
             }
-            frame = read_frame(&mut session.reader, &mut session.recv, session.max_frame) => {
-                let frame = frame?;
+            incoming = frame_rx.recv() => {
+                let Some(frame) = incoming else {
+                    break;
+                };
                 match frame.typ {
                     frame_type::DATA => {
                         let data = frame.decode_data()?;
-                        local_writer.write_all(data).await?;
+                        if local_writer.write_all(data).await.is_err() {
+                            break;
+                        }
                     }
                     frame_type::CLOSE | frame_type::ERROR => break,
                     frame_type::PING => {
                         write_frame(
-                            &mut session.writer,
-                            &mut session.send,
+                            &mut writer,
+                            &mut send,
                             &Frame::pong(frame.stream_id, frame.body.clone()),
                         ).await?;
                     }
@@ -369,5 +395,25 @@ pub(crate) async fn relay_with_initial(
             }
         }
     }
+    reader_task.abort();
+    let _ = write_frame(&mut writer, &mut send, &Frame::close(STREAM_ID, 0)).await;
     Ok(())
+}
+
+async fn frame_pump(
+    mut reader: tokio::net::tcp::OwnedReadHalf,
+    mut recv: FrameCipher,
+    max_frame: usize,
+    tx: mpsc::Sender<Frame>,
+) {
+    loop {
+        match read_frame(&mut reader, &mut recv, max_frame).await {
+            Ok(frame) => {
+                if tx.send(frame).await.is_err() {
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+    }
 }

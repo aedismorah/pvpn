@@ -1,6 +1,7 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
 use std::collections::VecDeque;
+use std::fs;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::path::PathBuf;
@@ -58,6 +59,8 @@ struct UiConfig {
     disabled_domains: Vec<String>,
     #[serde(default)]
     blacklist: bool,
+    #[serde(default)]
+    proxy_all: bool,
 }
 
 impl Default for UiConfig {
@@ -71,6 +74,7 @@ impl Default for UiConfig {
             domains: DEFAULT_DOMAINS.iter().map(|s| s.to_string()).collect(),
             disabled_domains: Vec::new(),
             blacklist: false,
+            proxy_all: false,
         }
     }
 }
@@ -90,7 +94,7 @@ impl UiConfig {
             .and_then(|text| toml::from_str(&text).ok())
             .unwrap_or_default();
         if let Some((host, port)) = config.server.rsplit_once(':') {
-            if port == "443" || port == "9443" {
+            if host == "87.242.102.100" && (port == "443" || port == "9443") {
                 config.server = format!("{host}:9331");
             }
         }
@@ -150,6 +154,7 @@ struct PvpnApp {
     test_busy: bool,
     ping_text: String,
     speed_text: String,
+    last_proxy_repair: Instant,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -255,6 +260,7 @@ impl PvpnApp {
             test_busy: false,
             ping_text: String::new(),
             speed_text: String::new(),
+            last_proxy_repair: Instant::now(),
         }
     }
 
@@ -422,12 +428,18 @@ impl PvpnApp {
         self.pac.state.set_proxy(proxy_addr(&self.config.http_listen));
         self.pac.state.set_domains(self.active_domains());
         self.pac.state.set_blacklist(self.config.blacklist);
-        match set_pac_url(&self.pac_url()) {
+        self.pac.state.set_proxy_all(self.config.proxy_all);
+        let proxy = proxy_addr(&self.config.http_listen);
+        if let Err(error) = capture_proxy_backup() {
+            self.fail(format!("Could not save the existing proxy settings: {error}"));
+            return;
+        }
+        match set_pac_url(&self.pac_url(), &proxy) {
             Ok(()) => {
                 self.proxy_on = true;
                 self.status = "System proxy enabled".into();
                 self.clear_error();
-                self.log("System proxy enabled (PAC)");
+                self.log("System proxy enabled (PAC + WinHTTP fallback)");
                 self.persist();
             }
             Err(error) => self.fail(format!("Could not enable system proxy: {error}")),
@@ -448,6 +460,27 @@ impl PvpnApp {
         }
     }
 
+    fn repair_static_proxy(&mut self) {
+        if self.tunnel.is_none() {
+            return;
+        }
+        if self.last_proxy_repair.elapsed() < Duration::from_secs(10) {
+            return;
+        }
+        self.last_proxy_repair = Instant::now();
+        let pac_configured = pac_configured().unwrap_or(false);
+        if !self.proxy_on && !pac_configured {
+            return;
+        }
+        if !self.proxy_on {
+            self.proxy_on = true;
+            self.status = "System proxy enabled".into();
+            self.log("Recovered active system proxy");
+        }
+        let proxy = proxy_addr(&self.config.http_listen);
+        let _ = set_pac_url(&self.pac_url(), &proxy);
+    }
+
     fn pac_url(&self) -> String {
         let version = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -466,8 +499,10 @@ impl PvpnApp {
         self.pac.state.set_proxy(proxy_addr(&self.config.http_listen));
         self.pac.state.set_domains(self.active_domains());
         self.pac.state.set_blacklist(self.config.blacklist);
+        self.pac.state.set_proxy_all(self.config.proxy_all);
         if self.proxy_on {
-            if let Err(error) = set_pac_url(&self.pac_url()) {
+            let proxy = proxy_addr(&self.config.http_listen);
+            if let Err(error) = set_pac_url(&self.pac_url(), &proxy) {
                 self.fail(format!("Could not refresh PAC: {error}"));
             }
         }
@@ -785,6 +820,7 @@ impl eframe::App for PvpnApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_background_errors();
         self.poll_tests(ctx);
+        self.repair_static_proxy();
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             self.screen = Screen::Main;
         }
@@ -1075,7 +1111,9 @@ impl eframe::App for PvpnApp {
                         });
 
                         card(ui, "Split tunneling", |ui| {
-                            let mode = if self.config.blacklist {
+                            let mode = if self.config.proxy_all {
+                                "All traffic via proxy"
+                            } else if self.config.blacklist {
                                 "Black list"
                             } else {
                                 "White list"
@@ -1090,7 +1128,17 @@ impl eframe::App for PvpnApp {
                                 .size(12.0)
                                 .color(MUTED),
                             );
+                            if self.config.proxy_all {
+                                ui.label(
+                                    egui::RichText::new(
+                                        "Split tunneling is disabled; every domain uses the proxy.",
+                                    )
+                                    .size(12.0)
+                                    .color(MUTED),
+                                );
+                            }
                             ui.add_space(4.0);
+                            ui.horizontal(|ui| {
                             if ui
                                 .add(
                                     egui::Button::new(
@@ -1105,6 +1153,37 @@ impl eframe::App for PvpnApp {
                             {
                                 self.screen = Screen::SplitTunneling;
                             }
+                            let disable_split = !self.config.proxy_all;
+                            if ui
+                                .add(
+                                    egui::Button::new(
+                                        egui::RichText::new(if disable_split {
+                                            "Disable split tunneling"
+                                        } else {
+                                            "Enable split tunneling"
+                                        })
+                                        .strong()
+                                        .color(egui::Color32::WHITE),
+                                    )
+                                    .fill(if disable_split {
+                                        egui::Color32::from_rgb(78, 42, 30)
+                                    } else {
+                                        egui::Color32::from_rgb(22, 92, 72)
+                                    })
+                                    .min_size(egui::vec2(190.0, 32.0)),
+                                )
+                                .clicked()
+                            {
+                                self.config.proxy_all = disable_split;
+                                self.apply_pac();
+                                self.persist();
+                                self.log(if disable_split {
+                                    "Split tunneling disabled; proxying all traffic"
+                                } else {
+                                    "Split tunneling enabled"
+                                });
+                            }
+                            });
                         });
 
                         card(ui, "Connection test", |ui| {
@@ -1640,7 +1719,167 @@ fn wait_listen(addr: &str, attempts: usize) -> bool {
 }
 
 #[cfg(windows)]
-fn set_pac_url(url: &str) -> Result<(), String> {
+fn pac_configured() -> Result<bool, String> {
+    use std::os::windows::process::CommandExt;
+    let output = std::process::Command::new("reg")
+        .args([
+            "query",
+            "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings",
+            "/v",
+            "AutoConfigURL",
+        ])
+        .creation_flags(0x08000000)
+        .output()
+        .map_err(|error| error.to_string())?;
+    if !output.status.success() {
+        return Ok(false);
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).contains("127.0.0.1:7892"))
+}
+
+#[cfg(windows)]
+#[derive(Default, Serialize, Deserialize)]
+struct ProxyBackup {
+    auto_config_url: Option<String>,
+    proxy_server: Option<String>,
+    proxy_override: Option<String>,
+    proxy_enable: Option<u32>,
+    auto_detect: Option<u32>,
+}
+
+#[cfg(windows)]
+fn proxy_backup_path() -> Option<PathBuf> {
+    Some(PathBuf::from(std::env::var_os("APPDATA")?).join("pvpn").join("proxy-backup.json"))
+}
+
+#[cfg(windows)]
+fn reg_value(name: &str) -> Result<Option<String>, String> {
+    use std::os::windows::process::CommandExt;
+    let output = std::process::Command::new("reg")
+        .args([
+            "query",
+            "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings",
+            "/v",
+            name,
+        ])
+        .creation_flags(0x08000000)
+        .output()
+        .map_err(|error| error.to_string())?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    for line in text.lines() {
+        let mut parts = line.split_whitespace();
+        if parts.next() == Some(name) {
+            let _kind = parts.next();
+            let value = parts.collect::<Vec<_>>().join(" ");
+            return Ok(Some(value));
+        }
+    }
+    Ok(None)
+}
+
+#[cfg(windows)]
+fn reg_dword(name: &str) -> Result<Option<u32>, String> {
+    let Some(value) = reg_value(name)? else {
+        return Ok(None);
+    };
+    let value = value.trim();
+    let parsed = if let Some(hex) = value.strip_prefix("0x") {
+        u32::from_str_radix(hex, 16)
+    } else {
+        value.parse::<u32>()
+    };
+    parsed.map(Some).map_err(|error| error.to_string())
+}
+
+#[cfg(windows)]
+fn capture_proxy_backup() -> Result<(), String> {
+    let Some(path) = proxy_backup_path() else {
+        return Ok(());
+    };
+    if path.exists() {
+        return Ok(());
+    }
+    let backup = ProxyBackup {
+        auto_config_url: reg_value("AutoConfigURL")?,
+        proxy_server: reg_value("ProxyServer")?,
+        proxy_override: reg_value("ProxyOverride")?,
+        proxy_enable: reg_dword("ProxyEnable")?,
+        auto_detect: reg_dword("AutoDetect")?,
+    };
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    let data = serde_json::to_vec_pretty(&backup).map_err(|error| error.to_string())?;
+    fs::write(&path, data).map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn write_reg_sz(name: &str, value: Option<&str>) -> Result<(), String> {
+    match value {
+        Some(value) => reg(&[
+            "add",
+            "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings",
+            "/v",
+            name,
+            "/t",
+            "REG_SZ",
+            "/d",
+            value,
+            "/f",
+        ]),
+        None => {
+            let _ = reg(&[
+                "delete",
+                "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings",
+                "/v",
+                name,
+                "/f",
+            ]);
+            Ok(())
+        }
+    }
+}
+
+#[cfg(windows)]
+fn write_reg_dword(name: &str, value: Option<u32>) -> Result<(), String> {
+    let text = value.unwrap_or(0).to_string();
+    reg(&[
+        "add",
+        "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings",
+        "/v",
+        name,
+        "/t",
+        "REG_DWORD",
+        "/d",
+        text.as_str(),
+        "/f",
+    ])
+}
+
+#[cfg(windows)]
+fn restore_proxy_backup() -> Result<bool, String> {
+    let Some(path) = proxy_backup_path() else {
+        return Ok(false);
+    };
+    let Ok(data) = fs::read(&path) else {
+        return Ok(false);
+    };
+    let backup: ProxyBackup = serde_json::from_slice(&data).map_err(|error| error.to_string())?;
+    write_reg_sz("AutoConfigURL", backup.auto_config_url.as_deref())?;
+    write_reg_sz("ProxyServer", backup.proxy_server.as_deref())?;
+    write_reg_sz("ProxyOverride", backup.proxy_override.as_deref())?;
+    write_reg_dword("ProxyEnable", backup.proxy_enable)?;
+    write_reg_dword("AutoDetect", backup.auto_detect)?;
+    let _ = fs::remove_file(path);
+    Ok(true)
+}
+
+#[cfg(windows)]
+fn set_pac_url(url: &str, proxy: &str) -> Result<(), String> {
     reg(&[
         "add",
         "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings",
@@ -1652,6 +1891,31 @@ fn set_pac_url(url: &str) -> Result<(), String> {
         url,
         "/f",
     ])?;
+    // PAC-aware applications use AutoConfigURL for split tunneling. Apps that
+    // only understand a static proxy (Codex, some Electron/CLI tools) use this
+    // fallback and therefore get the full tunnel.
+    reg(&[
+        "add",
+        "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings",
+        "/v",
+        "ProxyServer",
+        "/t",
+        "REG_SZ",
+        "/d",
+        proxy,
+        "/f",
+    ])?;
+    reg(&[
+        "add",
+        "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings",
+        "/v",
+        "ProxyOverride",
+        "/t",
+        "REG_SZ",
+        "/d",
+        "<local>",
+        "/f",
+    ])?;
     reg(&[
         "add",
         "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings",
@@ -1660,7 +1924,7 @@ fn set_pac_url(url: &str) -> Result<(), String> {
         "/t",
         "REG_DWORD",
         "/d",
-        "0",
+        "1",
         "/f",
     ])?;
     reg(&[
@@ -1680,27 +1944,11 @@ fn set_pac_url(url: &str) -> Result<(), String> {
 
 #[cfg(windows)]
 fn clear_pac() -> Result<(), String> {
-    // Deleting a missing value is fine; make the operation idempotent.
-    let _ = reg(&[
-        "delete",
-        "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings",
-        "/v",
-        "AutoConfigURL",
-        "/f",
-    ]);
-    reg(&[
-        "add",
-        "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings",
-        "/v",
-        "ProxyEnable",
-        "/t",
-        "REG_DWORD",
-        "/d",
-        "0",
-        "/f",
-    ])?;
-    refresh_wininet();
-    Ok(())
+    if restore_proxy_backup()? {
+        refresh_wininet();
+        return Ok(());
+    }
+    Err("proxy backup is missing; refusing to overwrite the original settings".into())
 }
 
 #[cfg(windows)]

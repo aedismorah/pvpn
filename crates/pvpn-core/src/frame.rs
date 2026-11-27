@@ -17,6 +17,7 @@ pub mod frame_type {
     pub const ERROR: u8 = 0x08;
     pub const OPEN_UDP: u8 = 0x09;
     pub const UDP_DATA: u8 = 0x0A;
+    pub const SHUT_WR: u8 = 0x0B;
 }
 
 pub mod open_status {
@@ -180,6 +181,12 @@ impl Frame {
         Self::new(frame_type::CLOSE, stream_id, vec![reason])
     }
 
+    /// Half-close the client-to-target direction without closing the target-to-client
+    /// direction. This is used when the local application shuts down its write side.
+    pub fn shutdown_write(stream_id: u32) -> Self {
+        Self::new(frame_type::SHUT_WR, stream_id, Vec::new())
+    }
+
     pub fn ping(stream_id: u32) -> Self {
         let mut payload = vec![0u8; 8];
         rand::thread_rng().fill(&mut payload[..]);
@@ -236,7 +243,8 @@ impl Frame {
             | frame_type::OPEN_RESULT
             | frame_type::ERROR
             | frame_type::OPEN_UDP
-            | frame_type::UDP_DATA => Ok(Self {
+            | frame_type::UDP_DATA
+            | frame_type::SHUT_WR => Ok(Self {
                 typ,
                 stream_id,
                 body,
